@@ -1,0 +1,10 @@
+wav2pdm
+pdm2pcm
+txt2bin
+packdata
+bin2txt
+__pycache__/
+*.pdm
+*.raw
+*.o
+*.wav
