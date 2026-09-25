@@ -3,6 +3,14 @@
 This directory contains the existing PDM acquisition helpers plus a
 closed-loop `wav2pdm` → `pdm2pcm` path for 16-bit mono/stereo WAV files.
 
+## Author and license
+
+Author: piaozhiye <piaozhiye@gmail.com>
+Copyright (c) 2026 piaozhiye
+
+This project is licensed under the Apache License, Version 2.0. See the
+repository `LICENSE` and `NOTICE` files for details.
+
 ## Build and tests
 
 ```sh

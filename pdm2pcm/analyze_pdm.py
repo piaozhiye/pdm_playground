@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 piaozhiye <piaozhiye@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Reproducible WAV -> PDM -> PCM measurements.
 
 The script generates a deterministic stereo test WAV, runs the local

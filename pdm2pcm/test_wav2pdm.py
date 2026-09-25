@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 piaozhiye <piaozhiye@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Tests for wav2pdm and pdm2pcm closed loop."""
 import math
 import os

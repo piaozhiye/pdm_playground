@@ -1,4 +1,8 @@
-/** \file wav2pdm.c
+/**
+ * Copyright (c) 2026 piaozhiye <piaozhiye@gmail.com>
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * \file wav2pdm.c
  * Convert mono/stereo S16 LE WAV to packed PDM for pdm2pcm.
  * Usage: wav2pdm -f <pdm_hz> -d <64|128> [-o 1|2] < in.wav > out.dat
  *        -o 1 : 1st-order Σ-Δ (default)
