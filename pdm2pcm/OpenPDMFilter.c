@@ -34,12 +34,10 @@
 
 /* Variables -----------------------------------------------------------------*/
 
-uint32_t div_const = 0;
+int64_t div_const = 0;
 int64_t sub_const = 0;
-uint32_t sinc[DECIMATION_MAX * SINCN];
-uint32_t sinc1[DECIMATION_MAX];
-uint32_t sinc2[DECIMATION_MAX * 2];
-uint32_t coef[SINCN][DECIMATION_MAX];
+int64_t sinc[DECIMATION_MAX * SINCN];
+int64_t coef[SINCN][DECIMATION_MAX];
 #ifdef USE_LUT
 int32_t lut[256][DECIMATION_MAX / 8][SINCN];
 #endif
@@ -146,13 +144,14 @@ int32_t filter_table_R_128(uint8_t *data, uint8_t sincn)
 }
 int32_t (* filter_tables_64[2]) (uint8_t *data, uint8_t sincn) = {filter_table_mono_64, filter_table_stereo_64};
 int32_t (* filter_tables_128[2]) (uint8_t *data, uint8_t sincn) = {filter_table_mono_128, filter_table_stereo_128};
-#else
-int32_t filter_table(uint8_t *data, uint8_t sincn, TPDMFilter_InitStruct *param)
+#endif
+
+int64_t filter_table(uint8_t *data, uint8_t sincn, TPDMFilter_InitStruct *param)
 {
   uint8_t c, i;
   uint16_t data_index = 0;
-  uint32_t *coef_p = &coef[sincn][0];
-  int32_t F = 0;
+  int64_t *coef_p = &coef[sincn][0];
+  int64_t F = 0;
   uint8_t decimation = param->Decimation;
   uint8_t channels = param->In_MicChannels;
 
@@ -170,7 +169,31 @@ int32_t filter_table(uint8_t *data, uint8_t sincn, TPDMFilter_InitStruct *param)
   }
   return F;
 }
-#endif
+
+/* R-channel variant of filter_table: odd bytes (byte-interleaved stereo). */
+static int64_t filter_table_R(uint8_t *data, uint8_t sincn, TPDMFilter_InitStruct *param)
+{
+  uint8_t c, i;
+  uint16_t data_index = param->In_MicChannels - 1;
+  int64_t *coef_p = &coef[sincn][0];
+  int64_t F = 0;
+  uint8_t decimation = param->Decimation;
+  uint8_t channels = param->In_MicChannels;
+
+  for (i = 0; i < decimation; i += 8) {
+    c = data[data_index];
+    F += ((c >> 7)       ) * coef_p[i    ] +
+         ((c >> 6) & 0x01) * coef_p[i + 1] +
+         ((c >> 5) & 0x01) * coef_p[i + 2] +
+         ((c >> 4) & 0x01) * coef_p[i + 3] +
+         ((c >> 3) & 0x01) * coef_p[i + 4] +
+         ((c >> 2) & 0x01) * coef_p[i + 5] +
+         ((c >> 1) & 0x01) * coef_p[i + 6] +
+         ((c     ) & 0x01) * coef_p[i + 7];
+    data_index += channels;
+  }
+  return F;
+}
 
 void convolve(uint32_t Signal[/* SignalLen */], unsigned short SignalLen,
               uint32_t Kernel[/* KernelLen */], unsigned short KernelLen,
@@ -196,7 +219,7 @@ void convolve(uint32_t Signal[/* SignalLen */], unsigned short SignalLen,
 void Open_PDM_Filter_Init(TPDMFilter_InitStruct *Param)
 {
   uint16_t i, j;
-  int64_t sum = 0;
+  uint64_t sum = 0;
 
   uint8_t decimation = Param->Decimation;
 
@@ -205,21 +228,46 @@ void Open_PDM_Filter_Init(TPDMFilter_InitStruct *Param)
     Param->CoefR[i] = 0;
     Param->bit[i] = 0;
   }
-  for (i = 0; i < decimation; i++) {
-    sinc1[i] = 1;
-  }
-
   Param->OldOut = Param->OldIn = Param->OldZ = 0;
   Param->OldOutR = Param->OldInR = Param->OldZR = 0;
   Param->LP_ALFA = (Param->LP_HZ != 0 ? (uint16_t) (Param->LP_HZ * 256 / (Param->LP_HZ + Param->Fs / (2 * 3.14159))) : 0);
   Param->HP_ALFA = (Param->HP_HZ != 0 ? (uint16_t) (Param->Fs * 256 / (2 * 3.14159 * Param->HP_HZ + Param->Fs)) : 0);
 
-  Param->FilterLen = decimation * SINCN;       
-  sinc[0] = 0;
-  sinc[decimation * SINCN - 1] = 0;      
-  convolve(sinc1, decimation, sinc1, decimation, sinc2);
-  convolve(sinc2, decimation * 2 - 1, sinc1, decimation, &sinc[1]);     
-  for(j = 0; j < SINCN; j++) {
+  Param->FilterLen = decimation * Param->CicOrder;
+  /* CIC kernel = boxcar^CicOrder, centered in sinc[] like stock:
+     conv length is CicOrder*(d-1)+1, padded (CicOrder-1)/2 zeros per end
+     (CicOrder is odd). One int64 build for both orders; integer-exact. */
+  {
+    int64_t cur[DECIMATION_MAX * SINCN] = {0};
+    int64_t nxt[DECIMATION_MAX * SINCN];
+    int cur_len = decimation, k, n, m;
+    int tap_shift = 0;
+    uint64_t ksum = 0;
+    for (n = 0; n < decimation; n++) cur[n] = 1;
+    for (k = 1; k < Param->CicOrder; k++) {
+      for (n = 0; n < cur_len + decimation - 1; n++) nxt[n] = 0;
+      for (n = 0; n < cur_len; n++)
+        for (m = 0; m < decimation; m++)
+          nxt[n + m] += cur[n];
+      cur_len += decimation - 1;
+      for (n = 0; n < cur_len; n++) cur[n] = nxt[n];
+    }
+    for (n = 0; n < cur_len; n++) ksum += (uint64_t)cur[n];
+    /* int64 headroom (Hogenauer W2): Z scales with the KERNEL SUM and the
+       HP stage forms ~3x Z and multiplies it by 255.  Keep the sum <= 2^54
+       so the fixed-point chain stays inside int64 for every supported
+       order/rate (CIC9 d=128 sums to 2^63 -> shift 9); the chain is
+       self-scaling (div_const follows the sum). */
+    while (tap_shift < 30 && (ksum >> tap_shift) > (1ULL << 54))
+      tap_shift++;
+    if (tap_shift)
+      for (n = 0; n < cur_len; n++)
+        cur[n] = (cur[n] + (1 << (tap_shift - 1))) >> tap_shift;
+    for (n = 0; n < SINCN * decimation; n++) sinc[n] = 0;
+    for (n = 0; n < cur_len; n++)
+      sinc[n + (Param->CicOrder - 1) / 2] = cur[n];
+  }
+  for(j = 0; j < Param->CicOrder; j++) {
     for (i = 0; i < decimation; i++) {
       coef[j][i] = sinc[j * decimation + i];
       sum += sinc[j * decimation + i];
@@ -227,15 +275,20 @@ void Open_PDM_Filter_Init(TPDMFilter_InitStruct *Param)
   }
 
   sub_const = sum >> 1;
-  div_const = sub_const * Param->MaxVolume / 32768 / FILTER_GAIN;
+  /* The tap rescaling above caps sum at 2^54, so sub_const*16 <= 2^57 fits
+     int64 and plain 64-bit arithmetic would do; __int128 stays as a guard
+     in case the rescaling is ever relaxed (unscaled N=9 d=128: sub_const*16
+     = 2^66, and div_const itself reaches 2^47, past uint32). */
+  div_const = (int64_t)((__int128)sub_const * Param->MaxVolume / 32768 / FILTER_GAIN);
   div_const = (div_const == 0 ? 1 : div_const);
 
 #ifdef USE_LUT
-  /* Look-Up Table. */
+  /* Look-Up Table. Only the 3-stage kernel fits the int32 LUT:
+     N=9 taps need ~50 bits and use the filter_table path instead. */
   uint16_t c, d, s;
-  for (s = 0; s < SINCN; s++)
+  for (s = 0; s < 3 && Param->CicOrder == 3; s++)
   {
-    uint32_t *coef_p = &coef[s][0];
+    int64_t *coef_p = &coef[s][0];
     for (c = 0; c < 256; c++)
       for (d = 0; d < decimation / 8; d++)
         lut[c][d][s] = ((c >> 7)       ) * coef_p[d * 8    ] +
@@ -250,13 +303,49 @@ void Open_PDM_Filter_Init(TPDMFilter_InitStruct *Param)
 #endif
 }
 
-void Open_PDM_Filter_64(uint8_t* data, int16_t* dataOut, uint16_t volume, TPDMFilter_InitStruct *Param)
+static int16_t open_pdm_quantize_16(int64_t value)
 {
-  uint8_t i, data_out_index;
+  value = RoundDiv(value, div_const);
+  value = SaturaLH(value, -32700, 32700);
+  return (int16_t)value;
+}
+
+static int32_t open_pdm_quantize_24(int64_t value)
+{
+  /* N=9 chains scale value up to ~2^56 (Hogenauer W2 + volume), so
+     value*256 would overflow int64.  When div_const is large enough the
+     division is done first -- exact, because div_const is a power of two
+     >= 512 for every supported order/rate combination. */
+  if (div_const >= 512)
+    value = RoundDiv(value, div_const / 256);
+  else
+    value = RoundDiv(value * 256, div_const);
+  value = SaturaLH(value, -8388608LL, 8388607LL);
+  return (int32_t)value;
+}
+
+static void open_pdm_store_sample(void *dataOut, uint32_t index,
+                                  uint8_t output_bits, int64_t value)
+{
+  if (output_bits == 24)
+    ((int32_t *)dataOut)[index] = open_pdm_quantize_24(value);
+  else
+    ((int16_t *)dataOut)[index] = open_pdm_quantize_16(value);
+}
+
+static void open_pdm_filter_64_common(uint8_t *data, void *dataOut,
+                                       uint16_t volume,
+                                       TPDMFilter_InitStruct *Param,
+                                       uint8_t output_bits)
+{
+  uint32_t i, data_out_index;
   uint8_t channels = Param->In_MicChannels;
   uint8_t data_inc = ((DECIMATION_MAX >> 4) * channels);
-  int64_t Z, Z0, Z1, Z2;
-  int64_t ZR, ZR0, ZR1, ZR2;
+  int64_t Z;
+  int64_t z[SINCN];
+  int k;
+  int64_t ZR;
+  int64_t zr[SINCN];
   int64_t OldOut, OldIn, OldZ;
   int64_t OldOutR, OldInR, OldZR;
 
@@ -272,47 +361,54 @@ void Open_PDM_Filter_64(uint8_t* data, int16_t* dataOut, uint16_t volume, TPDMFi
 #endif
 
   for (i = 0, data_out_index = 0; i < Param->nSamples; i++, data_out_index += channels) {
+    /* Phase k contributes at delay (CicOrder-1-k) output samples:
+       Coef[k] must chain the PREVIOUS sample's Coef[k-1] (the stock
+       N=3 code is the k<=2 case of this loop). */
 #ifdef USE_LUT
-    Z0 = filter_tables_64[j](data, 0);
-    Z1 = filter_tables_64[j](data, 1);
-    Z2 = filter_tables_64[j](data, 2);
-#else
-    Z0 = filter_table(data, 0, Param);
-    Z1 = filter_table(data, 1, Param);
-    Z2 = filter_table(data, 2, Param);
+    if (Param->CicOrder == 3) {
+      for (k = 0; k < Param->CicOrder; k++)
+        z[k] = filter_tables_64[j](data, k);
+    } else
 #endif
+    {
+      for (k = 0; k < Param->CicOrder; k++)
+        z[k] = filter_table(data, k, Param);
+    }
 
-    Z = Param->Coef[1] + Z2 - sub_const;
-    Param->Coef[1] = Param->Coef[0] + Z1;
-    Param->Coef[0] = Z0;
+    Z = Param->Coef[Param->CicOrder - 2] + z[Param->CicOrder - 1] - sub_const;
+    for (k = Param->CicOrder - 1; k >= 1; k--)
+      Param->Coef[k] = Param->Coef[k - 1] + z[k];
+    Param->Coef[0] = z[0];
 
     OldOut = (Param->HP_ALFA * (OldOut + Z - OldIn)) >> 8;
     OldIn = Z;
     OldZ = ((256 - Param->LP_ALFA) * OldZ + Param->LP_ALFA * OldOut) >> 8;
 
     Z = OldZ * volume;
-    Z = RoundDiv(Z, div_const);
-    Z = SaturaLH(Z, -32700, 32700);
-
-    dataOut[data_out_index] = Z;
+    open_pdm_store_sample(dataOut, data_out_index, output_bits, Z);
     if (channels == 2) {
-      ZR0 = filter_table_R_64(data, 0);
-      ZR1 = filter_table_R_64(data, 1);
-      ZR2 = filter_table_R_64(data, 2);
+#ifdef USE_LUT
+      if (Param->CicOrder == 3) {
+        for (k = 0; k < Param->CicOrder; k++)
+          zr[k] = filter_table_R_64(data, k);
+      } else
+#endif
+      {
+        for (k = 0; k < Param->CicOrder; k++)
+          zr[k] = filter_table_R(data, k, Param);
+      }
 
-      ZR = Param->CoefR[1] + ZR2 - sub_const;
-      Param->CoefR[1] = Param->CoefR[0] + ZR1;
-      Param->CoefR[0] = ZR0;
+      ZR = Param->CoefR[Param->CicOrder - 2] + zr[Param->CicOrder - 1] - sub_const;
+      for (k = Param->CicOrder - 1; k >= 1; k--)
+        Param->CoefR[k] = Param->CoefR[k - 1] + zr[k];
+      Param->CoefR[0] = zr[0];
 
       OldOutR = (Param->HP_ALFA * (OldOutR + ZR - OldInR)) >> 8;
       OldInR = ZR;
       OldZR = ((256 - Param->LP_ALFA) * OldZR + Param->LP_ALFA * OldOutR) >> 8;
 
       ZR = OldZR * volume;
-      ZR = RoundDiv(ZR, div_const);
-      ZR = SaturaLH(ZR, -32700, 32700);
-
-      dataOut[data_out_index + 1] = ZR;
+      open_pdm_store_sample(dataOut, data_out_index + 1, output_bits, ZR);
     }
     data += data_inc;
   }
@@ -327,13 +423,19 @@ void Open_PDM_Filter_64(uint8_t* data, int16_t* dataOut, uint16_t volume, TPDMFi
   }
 }
 
-void Open_PDM_Filter_128(uint8_t* data, int16_t* dataOut, uint16_t volume, TPDMFilter_InitStruct *Param)
+static void open_pdm_filter_128_common(uint8_t *data, void *dataOut,
+                                       uint16_t volume,
+                                       TPDMFilter_InitStruct *Param,
+                                       uint8_t output_bits)
 {
-  uint8_t i, data_out_index;
+  uint32_t i, data_out_index;
   uint8_t channels = Param->In_MicChannels;
   uint8_t data_inc = ((DECIMATION_MAX >> 3) * channels);
-  int64_t Z, Z0, Z1, Z2;
-  int64_t ZR, ZR0, ZR1, ZR2;
+  int64_t Z;
+  int64_t z[SINCN];
+  int k;
+  int64_t ZR;
+  int64_t zr[SINCN];
   int64_t OldOut, OldIn, OldZ;
   int64_t OldOutR, OldInR, OldZR;
 
@@ -349,47 +451,52 @@ void Open_PDM_Filter_128(uint8_t* data, int16_t* dataOut, uint16_t volume, TPDMF
 #endif
 
   for (i = 0, data_out_index = 0; i < Param->nSamples; i++, data_out_index += channels) {
+    /* See open_pdm_filter_64_common for the cascade derivation. */
 #ifdef USE_LUT
-    Z0 = filter_tables_128[j](data, 0);
-    Z1 = filter_tables_128[j](data, 1);
-    Z2 = filter_tables_128[j](data, 2);
-#else
-    Z0 = filter_table(data, 0, Param);
-    Z1 = filter_table(data, 1, Param);
-    Z2 = filter_table(data, 2, Param);
+    if (Param->CicOrder == 3) {
+      for (k = 0; k < Param->CicOrder; k++)
+        z[k] = filter_tables_128[j](data, k);
+    } else
 #endif
+    {
+      for (k = 0; k < Param->CicOrder; k++)
+        z[k] = filter_table(data, k, Param);
+    }
 
-    Z = Param->Coef[1] + Z2 - sub_const;
-    Param->Coef[1] = Param->Coef[0] + Z1;
-    Param->Coef[0] = Z0;
+    Z = Param->Coef[Param->CicOrder - 2] + z[Param->CicOrder - 1] - sub_const;
+    for (k = Param->CicOrder - 1; k >= 1; k--)
+      Param->Coef[k] = Param->Coef[k - 1] + z[k];
+    Param->Coef[0] = z[0];
 
     OldOut = (Param->HP_ALFA * (OldOut + Z - OldIn)) >> 8;
     OldIn = Z;
     OldZ = ((256 - Param->LP_ALFA) * OldZ + Param->LP_ALFA * OldOut) >> 8;
 
     Z = OldZ * volume;
-    Z = RoundDiv(Z, div_const);
-    Z = SaturaLH(Z, -32700, 32700);
-
-    dataOut[data_out_index] = Z;
+    open_pdm_store_sample(dataOut, data_out_index, output_bits, Z);
     if (channels == 2) {
-      ZR0 = filter_table_R_128(data, 0);
-      ZR1 = filter_table_R_128(data, 1);
-      ZR2 = filter_table_R_128(data, 2);
+#ifdef USE_LUT
+      if (Param->CicOrder == 3) {
+        for (k = 0; k < Param->CicOrder; k++)
+          zr[k] = filter_table_R_128(data, k);
+      } else
+#endif
+      {
+        for (k = 0; k < Param->CicOrder; k++)
+          zr[k] = filter_table_R(data, k, Param);
+      }
 
-      ZR = Param->CoefR[1] + ZR2 - sub_const;
-      Param->CoefR[1] = Param->CoefR[0] + ZR1;
-      Param->CoefR[0] = ZR0;
+      ZR = Param->CoefR[Param->CicOrder - 2] + zr[Param->CicOrder - 1] - sub_const;
+      for (k = Param->CicOrder - 1; k >= 1; k--)
+        Param->CoefR[k] = Param->CoefR[k - 1] + zr[k];
+      Param->CoefR[0] = zr[0];
 
       OldOutR = (Param->HP_ALFA * (OldOutR + ZR - OldInR)) >> 8;
       OldInR = ZR;
       OldZR = ((256 - Param->LP_ALFA) * OldZR + Param->LP_ALFA * OldOutR) >> 8;
 
       ZR = OldZR * volume;
-      ZR = RoundDiv(ZR, div_const);
-      ZR = SaturaLH(ZR, -32700, 32700);
-
-      dataOut[data_out_index + 1] = ZR;
+      open_pdm_store_sample(dataOut, data_out_index + 1, output_bits, ZR);
     }
     data += data_inc;
   }
@@ -402,4 +509,24 @@ void Open_PDM_Filter_128(uint8_t* data, int16_t* dataOut, uint16_t volume, TPDMF
     Param->OldInR = OldInR;
     Param->OldZR = OldZR;
   }
+}
+
+void Open_PDM_Filter_64(uint8_t* data, int16_t* dataOut, uint16_t volume, TPDMFilter_InitStruct *Param)
+{
+  open_pdm_filter_64_common(data, dataOut, volume, Param, 16);
+}
+
+void Open_PDM_Filter_128(uint8_t* data, int16_t* dataOut, uint16_t volume, TPDMFilter_InitStruct *Param)
+{
+  open_pdm_filter_128_common(data, dataOut, volume, Param, 16);
+}
+
+void Open_PDM_Filter_64_24(uint8_t* data, int32_t* dataOut, uint16_t volume, TPDMFilter_InitStruct *Param)
+{
+  open_pdm_filter_64_common(data, dataOut, volume, Param, 24);
+}
+
+void Open_PDM_Filter_128_24(uint8_t* data, int32_t* dataOut, uint16_t volume, TPDMFilter_InitStruct *Param)
+{
+  open_pdm_filter_128_common(data, dataOut, volume, Param, 24);
 }

@@ -1,5 +1,6 @@
 wav2pdm
 pdm2pcm
+pdm_ref_decimator
 txt2bin
 packdata
 bin2txt

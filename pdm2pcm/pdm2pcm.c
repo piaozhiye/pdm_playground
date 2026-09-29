@@ -5,7 +5,11 @@
  * and sends PCM data to standard output
  * Example usage:
  *
+ * -n 9 selects the 9-stage CIC kernel (lower noise floor; the 16-bit
+ * output grid then becomes the bottleneck, so pair it with -b 24).
+ *
  * bzcat bellazio.txt.bz2 | ./txt2bin | ./pdm2pcm -f 1024000 -d128 | aplay -fS16_LE -c1 -r8000
+ * Use -b 24 for packed S24_LE output.
  */
 
 #include <stdio.h>
@@ -42,18 +46,25 @@ int main(int argc, char** argv)
 	int finished = 0;
 	unsigned int pdmSamplingF, decimationF, pcmSamplingF, pdmBufLen, pcmBufLen;
 	unsigned int channels = 1;
+	unsigned int pcmBits = 16;
+	unsigned int cic_order = 3;
 	uint8_t* pdmBuf;
-	int16_t* pcmBuf;
+	int32_t* pcmBuf;
+	uint8_t* pcmPacked;
 	TPDMFilter_InitStruct filter;
 
 	/* Get user options */
 	pdmSamplingF = decimationF = 0;
-	while((opt = getopt (argc, argv, "hf:d:c:")) != -1){
+	while((opt = getopt (argc, argv, "hf:d:c:b:n:")) != -1){
 		switch(opt){
 			case 'h':
-				printf("%s -h(elp) -f <PDM sampling frequency> -d <64|128> [-c <1|2>]\n", argv[0]);
+				printf("%s -h(elp) -f <PDM sampling frequency> -d <64|128> [-c <1|2>] [-b <16|24>] [-n <3|9>]\n", argv[0]);
 				printf("  -c 1: mono (default)\n");
 				printf("  -c 2: stereo\n");
+				printf("  -n 3: CIC order 3, the stock kernel (default)\n");
+				printf("  -n 9: CIC order 9, lower noise floor (use with -b 24)\n");
+				printf("  -b 16: signed 16-bit PCM (default)\n");
+				printf("  -b 24: packed signed 24-bit little-endian PCM\n");
 				printf("Example usage: bzcat bellazio.txt.bz2 | ./txt2bin | "
 				       "./pdm2pcm -f 1024000 -d128 | aplay -fS16_LE -c1 -r8000\n");
 				exit(0);
@@ -82,8 +93,24 @@ int main(int argc, char** argv)
 				}
 				break;
 
+			case 'n':
+				if (parse_uint_arg(optarg, &cic_order) != 0 ||
+				    (cic_order != 3 && cic_order != 9)) {
+					fprintf(stderr, "CIC order must be 3 or 9\n");
+					exit(1);
+				}
+				break;
+
+			case 'b':
+				if (parse_uint_arg(optarg, &pcmBits) != 0 ||
+				   (pcmBits != 16 && pcmBits != 24)) {
+					fprintf(stderr, "PCM bit depth must be 16 or 24\n");
+					exit(1);
+				}
+				break;
+
 			case '?':
-				if(optopt == 'f' || optopt == 'd' || optopt == 'c'){
+				if(optopt == 'f' || optopt == 'd' || optopt == 'c' || optopt == 'b'){
 					fprintf(stderr, "Option -%c requires argument\n", optopt);
 					exit(1);
 				}
@@ -123,7 +150,9 @@ int main(int argc, char** argv)
 	}
 
 	const size_t pdmBlockBytes = (size_t)(pdmBufLen / 8) * channels;
-	const size_t pcmBlockBytes = sizeof(int16_t) * (size_t)pcmBufLen * channels;
+	const size_t pcmSampleCount = (size_t)pcmBufLen * channels;
+	const size_t pcmWorkBytes = sizeof(int32_t) * pcmSampleCount;
+	const size_t pcmBlockBytes = (size_t)(pcmBits / 8) * pcmSampleCount;
 
 	pdmBuf = malloc(pdmBlockBytes);
 	if(pdmBuf == NULL){
@@ -131,9 +160,11 @@ int main(int argc, char** argv)
 		exit(EXIT_FAILURE);
 	}
 
-	pcmBuf = malloc(pcmBlockBytes);
-	if(pcmBuf == NULL){
+	pcmBuf = malloc(pcmWorkBytes);
+	pcmPacked = malloc(pcmBlockBytes);
+	if(pcmBuf == NULL || pcmPacked == NULL){
 		free(pdmBuf);
+		free(pcmPacked);
 		fprintf(stderr, "Cannot allocate memory\n");
 		exit(EXIT_FAILURE);
 	}
@@ -147,6 +178,7 @@ int main(int argc, char** argv)
 	filter.Out_MicChannels = channels;
 	filter.Decimation = decimationF;
 	filter.MaxVolume = 16;
+	filter.CicOrder = cic_order;
 	Open_PDM_Filter_Init(&filter);
 
 	while(finished == 0){
@@ -174,15 +206,29 @@ int main(int argc, char** argv)
 		}
 
 		/* Decode PDM. Oldest PDM bit is MSB. */
-		if(decimationF == 64)
-			Open_PDM_Filter_64(pdmBuf, pcmBuf, 1, &filter);
-		else
-			Open_PDM_Filter_128(pdmBuf, pcmBuf, 1, &filter);
+		if (pcmBits == 16) {
+			if(decimationF == 64)
+				Open_PDM_Filter_64(pdmBuf, (int16_t *)pcmBuf, 1, &filter);
+			else
+				Open_PDM_Filter_128(pdmBuf, (int16_t *)pcmBuf, 1, &filter);
+			memcpy(pcmPacked, pcmBuf, pcmBlockBytes);
+		} else {
+			if(decimationF == 64)
+				Open_PDM_Filter_64_24(pdmBuf, pcmBuf, 1, &filter);
+			else
+				Open_PDM_Filter_128_24(pdmBuf, pcmBuf, 1, &filter);
+			for (size_t i = 0; i < pcmSampleCount; i++) {
+				uint32_t sample = (uint32_t)pcmBuf[i];
+				pcmPacked[i * 3 + 0] = (uint8_t)(sample & 0xff);
+				pcmPacked[i * 3 + 1] = (uint8_t)((sample >> 8) & 0xff);
+				pcmPacked[i * 3 + 2] = (uint8_t)((sample >> 16) & 0xff);
+			}
+		}
 
 		/* Emit PCM decoded data to stdout. */
 		dataCount = 0;
 		while(dataCount < pcmBlockBytes){
-			ret = write(STDOUT_FILENO, pcmBuf + dataCount, pcmBlockBytes - dataCount);
+			ret = write(STDOUT_FILENO, pcmPacked + dataCount, pcmBlockBytes - dataCount);
 			if(ret < 0){
 				if(errno == EINTR) continue;
 				fprintf(stderr, "Error writing to STDOUT: %s\n", strerror(errno));
@@ -196,5 +242,8 @@ int main(int argc, char** argv)
 		}
 	}
 
+	free(pcmPacked);
+	free(pcmBuf);
+	free(pdmBuf);
 	return 0;
 }

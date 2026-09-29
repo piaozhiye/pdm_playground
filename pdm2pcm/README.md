@@ -1,7 +1,12 @@
 # PDM decoding on PC
 
 This directory contains the existing PDM acquisition helpers plus a
-closed-loop `wav2pdm` → `pdm2pcm` path for 16-bit mono/stereo WAV files.
+closed-loop `wav2pdm` → `pdm2pcm` path for 16-bit and 24-bit mono/stereo
+WAV files.
+
+`pdm2pcm` decodes packed PDM bytes to signed 16-bit PCM by default. Use
+`-b 24` to request native signed 24-bit output packed as little-endian
+three-byte samples (`S24_LE`).
 
 ## Author and license
 
@@ -20,13 +25,14 @@ python3 test_wav2pdm.py
 
 The test suite covers CLI validation, mono/stereo bit packing, d=64 and
 d=128 round-trips, first- and second-order encoding, a UBSan full-scale
-second-order run, and invalid `pdm2pcm` block geometry.
+second-order run, 24-bit PCM output, 24-bit WAV input, and invalid
+`pdm2pcm` block geometry.
 
 ## WAV → PDM → PCM
 
-`wav2pdm` reads S16 little-endian PCM WAV from stdin. The WAV sample rate
-must equal `f/d`; the PDM rate is `f` and the decimation factor is 64 or
-128.
+`wav2pdm` reads S16 or S24 little-endian PCM WAV from stdin and detects
+the sample width from the `fmt ` chunk. The WAV sample rate must equal
+`f/d`; the PDM rate is `f` and the decimation factor is 64 or 128.
 
 ```sh
 # First order (default)
@@ -35,6 +41,11 @@ must equal `f/d`; the PDM rate is `f` and the decimation factor is 64 or
 # Second order
 ./wav2pdm -f3072000 -d64 -o 2 < stereo.wav > stereo.pdm
 ```
+
+A 24-bit source is encoded at its own full scale: the modulator
+thresholds follow the input width (`32768`/`128` for 16-bit,
+`8388608`/`32768` for 24-bit), so 24-bit samples are not driven as if
+they were 16-bit.
 
 The `-o` value is applied to every input sample and to each stereo channel:
 
@@ -55,6 +66,44 @@ Mono is the default (`-c1` or omitted):
 ```sh
 ./pdm2pcm -f3072000 -d64 -c1 < mono.pdm > mono.raw
 ```
+
+### PCM output bit depth
+
+The default is signed 16-bit little-endian PCM:
+
+```sh
+./pdm2pcm -f3072000 -d64 -c1 < mono.pdm > mono.s16.raw
+aplay -f S16_LE -c 1 -r 48000 mono.s16.raw
+```
+
+Use `-b 24` for native signed 24-bit output packed as three-byte
+little-endian samples:
+
+```sh
+./pdm2pcm -f3072000 -d64 -c1 -b 24 < mono.pdm > mono.s24.raw
+aplay -f S24_LE -c 1 -r 48000 mono.s24.raw
+```
+
+`-b 16` and `-b 24` are the supported values. The 24-bit path keeps the
+filter's internal headroom and applies a 24-bit scale before saturation;
+it is not a 16-bit sample shifted by eight bits.
+
+### CIC order (-n 3 | 9)
+
+`-n` selects the number of CIC integrator stages. `-n 3` (the default) is
+the stock three-stage kernel and is bit-identical to previous releases.
+`-n 9` uses a nine-stage kernel: the stopband improves by ~107 dB and the
+measured decode noise floor drops from 0.254 to 0.071 LSB16 at d=128, which
+pushes it below the 16-bit quantization grid -- so `-n 9` only pays off
+combined with `-b 24` (measured 24-bit benefit at d=128: 4.35x / 12.8 dB in
+the chain residual; at d=64: 1.27x / 2.1 dB). Note the bare 9-stage kernel
+has ~-24 dB passband droop at 20 kHz; acoustic measurements remain
+microphone-noise limited either way.
+
+Internal widths follow Hogenauer's W2 = W1 + N*log2(R*D): the stage
+registers and div_const are 64-bit, and the 24-bit quantizer divides before
+multiplying when div_const is large, so no intermediate wraps for any
+supported order/rate combination (verified by the UBSan full-scale sweep).
 
 `pdm2pcm` processes complete 1 ms blocks, so the PDM rate must satisfy
 `f % (1000 * d) == 0`, and the resulting PCM rate must fit the filter API's

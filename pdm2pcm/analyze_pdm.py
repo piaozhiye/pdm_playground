@@ -160,8 +160,55 @@ def best_positive_lag(reference, decoded, max_lag):
     return best_lag, best_correlation
 
 
+def project_out_fundamental(signal, fundamental_hz, sample_rate, skip_ms, fft_size):
+    """Least-squares fit of a known-frequency sinusoid, returned as the residual.
+
+    Fitting [1, cos, sin] at the fundamental absorbs gain, phase and DC in
+    one step and needs no delay search at all.  That matters because an
+    integer-lag alignment cannot remove a fractional group delay:
+    OpenPDMFilter delays by 2977.09 samples, and the leftover 0.09 sample
+    is 0.0019 of a period at 1 kHz, which showed up as ~136 LSB16 of pure
+    phase residue.  That artifact was larger than every bit-depth effect
+    it was supposed to measure.
+
+    The constant column is not optional decoration.  An earlier version
+    subtracted the window mean first and fit only [cos, sin]; over a window
+    that is not a whole number of tone periods, cos/sin have non-zero means,
+    so the fit coupled the huge fundamental into the residual DC.  That put
+    ~25 LSB16 of tone leakage into an 8192-sample window (170.67 periods)
+    and made the floor look window-length dependent.  With DC inside the
+    basis the tone is removed exactly for ANY window length.
+
+    What survives the projection is harmonics, aliasing and noise, i.e.
+    exactly the noise floor of the decode chain.
+    """
+    skip = int(round(sample_rate * skip_ms / 1000.0))
+    size = min(fft_size, len(signal) - skip)
+    if size < 1024:
+        raise ValueError("not enough samples to project the fundamental")
+    window = np.asarray(signal[skip:skip + size], dtype=np.float64)
+    t = np.arange(size, dtype=np.float64)
+    omega = 2.0 * math.pi * fundamental_hz / sample_rate
+    basis = np.column_stack((np.ones(size), np.cos(omega * t), np.sin(omega * t)))
+    coef, *_ = np.linalg.lstsq(basis, window, rcond=None)
+    residual = window - basis @ coef
+    amplitude = math.hypot(coef[1], coef[2])
+    residual_rms = math.sqrt(float(np.mean(residual * residual)))
+    return {
+        "amplitude": amplitude,
+        "residual_rms": residual_rms,
+        "snr_db": db20(amplitude / residual_rms) if residual_rms > 0 else float("inf"),
+    }
+
+
 def residual_snr_db(reference, decoded, sample_rate, skip_ms, fft_size, max_lag):
-    """Measure residual SNR after integer-delay alignment and gain fit."""
+    """Measure residual SNR after integer-delay alignment and gain fit.
+
+    Kept for reporting the integer delay and the chain gain error.  Do not
+    read its snr_db as a noise floor: it still carries the fractional-delay
+    phase residue described in project_out_fundamental.  Use that function
+    for anything where the residual amplitude matters.
+    """
     skip = int(round(sample_rate * skip_ms / 1000.0))
     size = min(fft_size, len(reference) - skip, len(decoded) - skip)
     if size <= max_lag + 2:

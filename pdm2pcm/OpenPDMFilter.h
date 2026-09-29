@@ -51,7 +51,7 @@
  */
 #define USE_LUT
 
-#define SINCN            3
+#define SINCN            9   /* max CIC stages; runtime order in CicOrder (3 or 9) */
 #define DECIMATION_MAX 128
 #define FILTER_GAIN     16
 
@@ -72,16 +72,19 @@ typedef struct {
   uint8_t In_MicChannels;
   uint8_t Out_MicChannels;
   uint8_t Decimation;
+  uint8_t CicOrder;   /* CIC stage count: 3 (stock) or 9 */
   uint8_t MaxVolume;
   /* Private */
-  uint32_t Coef[SINCN];
-  uint32_t CoefR[SINCN];
+  /* CIC partial sums need up to N*log2(R*D) bits (Hogenauer):
+     N=9, d=128 taps reach 2^62, so these must be int64. */
+  int64_t Coef[SINCN];
+  int64_t CoefR[SINCN];
   uint16_t FilterLen;
   int64_t OldOut, OldIn, OldZ;
   int64_t OldOutR, OldInR, OldZR;
   uint16_t LP_ALFA;
   uint16_t HP_ALFA;
-  uint16_t bit[5];
+  uint16_t bit[SINCN];
   uint16_t byte;
 } TPDMFilter_InitStruct;
 
@@ -91,6 +94,8 @@ typedef struct {
 void Open_PDM_Filter_Init(TPDMFilter_InitStruct *init_struct);
 void Open_PDM_Filter_64(uint8_t* data, int16_t* data_out, uint16_t mic_gain, TPDMFilter_InitStruct *init_struct);
 void Open_PDM_Filter_128(uint8_t* data, int16_t* data_out, uint16_t mic_gain, TPDMFilter_InitStruct *init_struct);
+void Open_PDM_Filter_64_24(uint8_t* data, int32_t* data_out, uint16_t mic_gain, TPDMFilter_InitStruct *init_struct);
+void Open_PDM_Filter_128_24(uint8_t* data, int32_t* data_out, uint16_t mic_gain, TPDMFilter_InitStruct *init_struct);
 
 #ifdef __cplusplus
 }
